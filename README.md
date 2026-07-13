@@ -147,8 +147,8 @@ curl http://localhost:8080/actuator/health
 | URL 2 | `http://localhost:8080/actuator/health` |
 
 <!-- IMAGE: side-by-side or stacked screenshot of both Postman responses above -->
-![Health Check Responses in Postman](readme-images/Screenshot 2026-07-12 202027.png)
-![Health Check Responses in Postman](readme-images/Screenshot 2026-07-12 201955.png)
+![Invoice health check response in Postman](readme-images/Screenshot%202026-07-12%20202027.png)
+![Actuator health check response in Postman](readme-images/Screenshot%202026-07-12%20201955.png)
 
 Also check `http://localhost:15672` → **Queues tab**. You should see both queues created automatically:
 - `invoice_generation_queue`
