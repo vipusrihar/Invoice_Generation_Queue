@@ -230,7 +230,7 @@ curl -X POST http://localhost:8080/api/invoices/submit \
     "customerName": "CrashTest Corp",
     "customerEmail": "crash@test.com",
     "invoiceType": "ANNUAL_REPORT_INVOICE",
-    "complexityDots": ".....",
+    "complexityDots": "....................",
     "totalAmount": 99999.00,
     "currency": "USD"
   }'

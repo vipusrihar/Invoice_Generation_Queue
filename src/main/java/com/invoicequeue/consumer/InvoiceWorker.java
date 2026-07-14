@@ -132,16 +132,28 @@ public class InvoiceWorker {
                 log.warn("   Strategy: ACK original → re-publish with retryCount={}", nextRetryCount);
                 log.warn("");
 
-                // ── Step 1: ACK the original message ─────────────────
-                // Remove the original (retryCount=N) message from the queue.
-                // We are NOT using basicNack(requeue=true) because that
-                // re-queues the original bytes — our retryCount change is lost.
+                // ── Step 1: ACK the original message ─────────────────────────────
+                // We MUST remove the original message from the queue first.
+                //
+                // WHY basicAck here, not basicNack(requeue=true)?
+                //   basicNack(requeue=true) puts the ORIGINAL message bytes back.
+                //   Any Java object changes (like retryCount++) are thrown away.
+                //   The next delivery would still show retryCount=0 — infinite loop.
+                //
+                //   basicAck removes the old message permanently so we can
+                //   publish a fresh one with the correct retryCount in the JSON.
                 channel.basicAck(deliveryTag, false);
 
-                // ── Step 2: Re-publish with incremented retryCount ────
-                // Build a new InvoiceRequest with retryCount incremented,
-                // then publish it as a brand-new message. RabbitMQ stores
-                // the updated JSON, so the next worker reads the correct count.
+                // ── Step 2: Re-publish a NEW message with retryCount incremented ──
+                // nextRetryCount is already calculated above (getRetryCount() + 1).
+                // We use it here — NOT request.getRetryCount() + 1 again — to keep
+                // a single source of truth and avoid any off-by-one confusion.
+                //
+                // RabbitMQ will store this new JSON:
+                //   { ..., "retryCount": 1 }  on attempt 1
+                //   { ..., "retryCount": 2 }  on attempt 2
+                //   { ..., "retryCount": 3 }  on attempt 3
+                // On attempt 4, retryCount(3) >= MAX(3) → falls through to success.
                 InvoiceRequest retryRequest = InvoiceRequest.builder()
                         .invoiceId(request.getInvoiceId())
                         .customerName(request.getCustomerName())
@@ -151,7 +163,7 @@ public class InvoiceWorker {
                         .totalAmount(request.getTotalAmount())
                         .currency(request.getCurrency())
                         .submittedAt(request.getSubmittedAt())
-                        .retryCount(nextRetryCount)   // ← incremented value in the JSON
+                        .retryCount(nextRetryCount)  // ← use nextRetryCount, NOT request.getRetryCount()+1
                         .build();
 
                 rabbitTemplate.convertAndSend(invoiceExchange, invoiceRoutingKey, retryRequest);
