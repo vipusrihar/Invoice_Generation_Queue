@@ -1,9 +1,6 @@
 package com.invoicequeue.model;
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import lombok.*;
 
 import java.io.Serializable;
 import java.time.LocalDateTime;
@@ -20,10 +17,30 @@ import java.time.LocalDateTime;
  *   Think of this as the @RequestBody of an async operation.
  *   In a REST call, you send JSON in the HTTP body.
  *   In RabbitMQ, you send JSON as a message body. Same idea, different channel.
+ *
+ * WHY @Getter/@Setter instead of @Data?
+ *   @Data generates equals/hashCode based on all fields — which can cause subtle
+ *   bugs when objects are used in Sets or as Map keys. We only need getters,
+ *   setters, and constructors here, so we're explicit about what we want.
+ *
+ * IMPORTANT — retryCount field:
+ *   We do NOT use @Builder.Default here. Instead we initialise retryCount
+ *   inside the no-args constructor explicitly. This is because:
+ *
+ *   @Builder.Default requires @Builder to be present, and when Jackson
+ *   deserializes the JSON from RabbitMQ it uses the NO-ARGS constructor —
+ *   not the builder. So @Builder.Default has zero effect on deserialization.
+ *
+ *   The correct fix is to set the default in the no-args constructor directly,
+ *   so Jackson always gets retryCount = 0 on a fresh deserialization.
+ *
+ *   The worker then increments it on the Java object and re-publishes the
+ *   updated message back to the queue — so RabbitMQ's copy also has the
+ *   incremented count on the next delivery.
  */
-@Data
+@Getter
+@Setter
 @Builder
-@NoArgsConstructor
 @AllArgsConstructor
 public class InvoiceRequest implements Serializable {
 
@@ -57,9 +74,31 @@ public class InvoiceRequest implements Serializable {
     /** When the REST API accepted this job — set by the controller */
     private LocalDateTime submittedAt;
 
-    /** How many times this message has been retried (incremented on failure) */
-    @Builder.Default
-    private int retryCount = 0;
+    /**
+     * How many times this message has been retried.
+     *
+     * DEFAULT = 0 set in the no-args constructor below.
+     *
+     * DO NOT use @Builder.Default here. Jackson deserializes via the
+     * no-args constructor — @Builder.Default only affects the builder path
+     * and is completely ignored during JSON deserialization from RabbitMQ.
+     * Setting it here in the no-args constructor is the correct approach.
+     */
+    private int retryCount;
+
+    /**
+     * No-args constructor used by Jackson when deserializing messages
+     * from RabbitMQ. retryCount is explicitly set to 0 here so every
+     * fresh deserialization starts from zero correctly.
+     *
+     * NOTE: We cannot use @NoArgsConstructor alongside @Builder when we
+     * need to set field defaults, because Lombok's generated no-args
+     * constructor does NOT apply @Builder.Default values. Writing this
+     * constructor manually gives us full control.
+     */
+    public InvoiceRequest() {
+        this.retryCount = 0;
+    }
 
     // ------------------------------------------------------------------
     //  Invoice Types

@@ -2,9 +2,12 @@ package com.invoicequeue.consumer;
 
 import com.invoicequeue.model.InvoiceRequest;
 import com.rabbitmq.client.Channel;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.AmqpHeaders;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 
@@ -25,31 +28,54 @@ import java.time.format.DateTimeFormatter;
  *
  * SCENARIOS HANDLED:
  *   ✅ SUCCESS           — PDF rendered → basicAck → message removed from queue
- *   ⚠️  TRANSIENT FAILURE — temporary error (e.g. DB down) → basicNack(requeue=true) → retried
- *   ❌ PERMANENT FAILURE  — poison message (e.g. invalid data) → basicNack(requeue=false) → goes to DLQ
+ *   ⚠️  TRANSIENT FAILURE — temporary error → re-publish with incremented retryCount
+ *   ❌ PERMANENT FAILURE  — poison message → basicNack(requeue=false) → goes to DLQ
  *   💀 WORKER CRASH       — app killed mid-job → no ack sent → RabbitMQ re-queues automatically
  *
- * FAIR DISPATCH:
- *   prefetch=1 (set in application.properties) means this worker will NOT
- *   receive a second message until it calls basicAck on the current one.
- *   This prevents a slow worker from hoarding messages while a fast worker sits idle.
+ * ─────────────────────────────────────────────────────────────────────
+ * WHY WE RE-PUBLISH INSTEAD OF basicNack(requeue=true) FOR RETRIES:
+ * ─────────────────────────────────────────────────────────────────────
+ * When basicNack(requeue=true) is called, RabbitMQ re-queues the ORIGINAL
+ * message bytes — exactly as they arrived. Any changes made to the Java
+ * object (like incrementing retryCount) are completely discarded.
  *
- * COMPETING CONSUMERS:
- *   Multiple threads (or multiple app instances) all call @RabbitListener on
- *   the same queue. RabbitMQ guarantees each message goes to exactly ONE worker.
+ * So the retry scenario was broken like this:
+ *   Attempt 1 → retryCount=0 in JSON → worker sets retryCount=1 on Java object
+ *               → basicNack(requeue=true) → RabbitMQ re-queues original bytes
+ *   Attempt 2 → retryCount=0 in JSON again (original bytes!) → worker sees 0
+ *               → thinks it's the first attempt → loops forever, never hits max
+ *
+ * The correct approach for tracked retries:
+ *   1. basicAck the original message (remove it from the queue)
+ *   2. Re-publish a NEW message with retryCount incremented in the JSON body
+ *   3. On next delivery, the worker reads the correct retryCount from the JSON
+ *
+ * This way the retry counter is embedded in the message itself and survives
+ * each round-trip through RabbitMQ correctly.
+ * ─────────────────────────────────────────────────────────────────────
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class InvoiceWorker {
 
     private static final int MAX_RETRY_ATTEMPTS = 3;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
+    // Injected so we can re-publish the updated message for transient retries
+    private final RabbitTemplate rabbitTemplate;
+
+    @Value("${rabbitmq.exchange.invoice}")
+    private String invoiceExchange;
+
+    @Value("${rabbitmq.routing.key.invoice}")
+    private String invoiceRoutingKey;
+
     /**
      * Main message handler — called by Spring AMQP for each message.
      *
-     * Parameters explained:
-     *   InvoiceRequest request — Jackson auto-deserializes the JSON body into this object
+     * Parameters:
+     *   InvoiceRequest request — Jackson deserializes the JSON body into this object
      *   Channel channel        — raw AMQP channel needed to send ack/nack manually
      *   long deliveryTag       — unique ID for this specific delivery (used in ack/nack)
      */
@@ -78,113 +104,120 @@ public class InvoiceWorker {
 
         try {
 
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
             //  SCENARIO 1: SIMULATED PERMANENT FAILURE
-            //  If invoiceId contains "FAIL", treat it as a poison message.
-            //  This tests the DLQ path.
-            // --------------------------------------------------------
+            //  If invoiceId contains "FAIL", treat as a poison message.
+            // ────────────────────────────────────────────────────────
             if (request.getInvoiceId().toUpperCase().contains("FAIL")) {
                 throw new IllegalArgumentException(
-                    "PERMANENT FAILURE: Invoice ID '" + request.getInvoiceId() +
-                    "' is flagged as invalid. Routing to Dead Letter Queue."
+                        "PERMANENT FAILURE: Invoice ID '" + request.getInvoiceId() +
+                                "' is flagged as invalid. Routing to Dead Letter Queue."
                 );
             }
 
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
             //  SCENARIO 2: SIMULATED TRANSIENT FAILURE
-            //  If invoiceId contains "RETRY" and we haven't retried 3x yet,
+            //  If invoiceId contains "RETRY" and we haven't exceeded max attempts,
             //  simulate a temporary failure (e.g. database timeout).
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
             if (request.getInvoiceId().toUpperCase().contains("RETRY")
                     && request.getRetryCount() < MAX_RETRY_ATTEMPTS) {
-                request.setRetryCount(request.getRetryCount() + 1);
-                throw new RuntimeException(
-                    "TRANSIENT FAILURE (attempt " + request.getRetryCount() + "/" + MAX_RETRY_ATTEMPTS +
-                    "): Simulating DB timeout for " + request.getInvoiceId()
-                );
+
+                int nextRetryCount = request.getRetryCount() + 1;
+
+                log.warn("");
+                log.warn("⚠️  ⚠️  ⚠️  TRANSIENT FAILURE — attempt {}/{} for {}",
+                        nextRetryCount, MAX_RETRY_ATTEMPTS, request.getInvoiceId());
+                log.warn("   Reason: Simulating DB timeout");
+                log.warn("   Strategy: ACK original → re-publish with retryCount={}", nextRetryCount);
+                log.warn("");
+
+                // ── Step 1: ACK the original message ─────────────────
+                // Remove the original (retryCount=N) message from the queue.
+                // We are NOT using basicNack(requeue=true) because that
+                // re-queues the original bytes — our retryCount change is lost.
+                channel.basicAck(deliveryTag, false);
+
+                // ── Step 2: Re-publish with incremented retryCount ────
+                // Build a new InvoiceRequest with retryCount incremented,
+                // then publish it as a brand-new message. RabbitMQ stores
+                // the updated JSON, so the next worker reads the correct count.
+                InvoiceRequest retryRequest = InvoiceRequest.builder()
+                        .invoiceId(request.getInvoiceId())
+                        .customerName(request.getCustomerName())
+                        .customerEmail(request.getCustomerEmail())
+                        .invoiceType(request.getInvoiceType())
+                        .complexityDots(request.getComplexityDots())
+                        .totalAmount(request.getTotalAmount())
+                        .currency(request.getCurrency())
+                        .submittedAt(request.getSubmittedAt())
+                        .retryCount(nextRetryCount)   // ← incremented value in the JSON
+                        .build();
+
+                rabbitTemplate.convertAndSend(invoiceExchange, invoiceRoutingKey, retryRequest);
+
+                log.warn("   ✉️  Re-published {} with retryCount={} — will be picked up shortly.",
+                        request.getInvoiceId(), nextRetryCount);
+                return; // exit — do not fall through to the success ack below
             }
 
-            // --------------------------------------------------------
-            //  SCENARIO 3: NORMAL SUCCESS PATH
-            //  Simulate actual PDF generation work
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
+            //  SCENARIO 3: NORMAL SUCCESS PATH (includes RETRY after max attempts)
+            //  If retryCount >= MAX_RETRY_ATTEMPTS, we stop retrying and
+            //  process normally — the "fault" clears after enough attempts.
+            // ────────────────────────────────────────────────────────
+            if (request.getInvoiceId().toUpperCase().contains("RETRY")
+                    && request.getRetryCount() >= MAX_RETRY_ATTEMPTS) {
+                log.info("✅ RETRY RESOLVED — {} succeeded after {} attempt(s). Processing now.",
+                        request.getInvoiceId(), request.getRetryCount());
+            }
+
             generateInvoicePdf(request, workerName);
 
-            // --------------------------------------------------------
-            //  SUCCESS ACK
-            //  This tells RabbitMQ: "I finished this job. Remove it from the queue."
-            //
-            //  basicAck(deliveryTag, multiple):
-            //    deliveryTag — which message we're acknowledging
-            //    multiple=false — only ack THIS message, not all pending ones
-            //
-            //  IMPORTANT: This only runs if generateInvoicePdf() completes
-            //  without throwing. If the worker is killed (Ctrl+C) before this
-            //  line, RabbitMQ never receives the ack and re-queues the message.
-            // --------------------------------------------------------
+            // ── SUCCESS ACK ──────────────────────────────────────────
+            // Tell RabbitMQ: "I finished this job. Remove it from the queue."
+            // Only reached if generateInvoicePdf() completed without throwing.
+            // If the worker is killed before this line, no ack is sent and
+            // RabbitMQ automatically re-queues the message.
             channel.basicAck(deliveryTag, false);
 
             log.info("");
-            log.info("✅ ✅ ✅  JOB COMPLETE — {} acknowledged and removed from queue", request.getInvoiceId());
-            log.info("   Customer {} will receive their PDF at {}", request.getCustomerName(), request.getCustomerEmail());
+            log.info("✅ ✅ ✅  JOB COMPLETE — {} acknowledged and removed from queue",
+                    request.getInvoiceId());
+            log.info("   Customer {} will receive their PDF at {}",
+                    request.getCustomerName(), request.getCustomerEmail());
             log.info("");
 
         } catch (IllegalArgumentException e) {
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
             //  PERMANENT FAILURE → DEAD LETTER QUEUE
-            //  This message has bad data that no amount of retrying will fix.
-            //  basicNack with requeue=false sends it to the DLQ.
-            // --------------------------------------------------------
+            //  Bad data that no amount of retrying will fix.
+            //  basicNack(requeue=false) → Dead Letter Exchange → DLQ
+            // ────────────────────────────────────────────────────────
             log.error("");
-            log.error("❌ ❌ ❌  PERMANENT FAILURE for {} — routing to Dead Letter Queue", request.getInvoiceId());
+            log.error("❌ ❌ ❌  PERMANENT FAILURE for {} — routing to Dead Letter Queue",
+                    request.getInvoiceId());
             log.error("   Reason: {}", e.getMessage());
-            log.error("   This message will NOT be retried. Check DLQ: invoice_dead_letter_queue");
+            log.error("   This message will NOT be retried.");
             log.error("");
 
-            // requeue=false → goes to Dead Letter Exchange → lands in DLQ
             channel.basicNack(deliveryTag, false, false);
 
-        } catch (RuntimeException e) {
-            // --------------------------------------------------------
-            //  TRANSIENT FAILURE → RE-QUEUE FOR RETRY
-            //  Something went wrong but it might succeed on a retry
-            //  (e.g., DB was temporarily down, external service timed out).
-            //  basicNack with requeue=true puts it back in the queue.
-            // --------------------------------------------------------
-            log.warn("");
-            log.warn("⚠️  ⚠️  ⚠️   TRANSIENT FAILURE for {} (retry {})", request.getInvoiceId(), request.getRetryCount());
-            log.warn("   Reason: {}", e.getMessage());
-            log.warn("   Message will be RE-QUEUED for another worker to attempt.");
-            log.warn("");
-
-            // requeue=true → message goes back to invoice_generation_queue
-            channel.basicNack(deliveryTag, false, true);
-
         } catch (InterruptedException e) {
-            // --------------------------------------------------------
-            //  WORKER INTERRUPTED (e.g. JVM shutdown during Thread.sleep)
-            //  Restore the interrupt flag and nack so the message is re-queued.
-            // --------------------------------------------------------
+            // ────────────────────────────────────────────────────────
+            //  WORKER INTERRUPTED during Thread.sleep (JVM shutdown)
+            //  Restore the interrupt flag and nack so it is re-queued.
+            // ────────────────────────────────────────────────────────
             Thread.currentThread().interrupt();
-            log.error("⚠️  Worker thread interrupted while processing {}. Re-queuing.", request.getInvoiceId());
+            log.error("⚠️  Worker interrupted while processing {}. Re-queuing.",
+                    request.getInvoiceId());
             channel.basicNack(deliveryTag, false, true);
         }
     }
 
     /**
      * Simulates PDF generation work.
-     *
      * Each '.' in complexityDots = 1 second of rendering.
-     * Logs progress second-by-second so you can see Fair Dispatch in action
-     * in real time across multiple worker threads.
-     *
-     * Real-world equivalent of this method:
-     *   - Fetch customer data from DB
-     *   - Fetch line items from order service
-     *   - Render PDF using iText or Apache PDFBox
-     *   - Apply company watermark and digital signature
-     *   - Upload PDF to S3 / Azure Blob Storage
-     *   - Send email with PDF link via SendGrid / SES
      */
     private void generateInvoicePdf(InvoiceRequest request, String workerName)
             throws InterruptedException {
@@ -214,7 +247,6 @@ public class InvoiceWorker {
                 request.getTotalAmount());
     }
 
-    /** Returns a human-readable description of what the PDF renderer is doing */
     private String getRenderingStep(int current, int total) {
         if (total == 1) return "Generating single-page receipt";
         double progress = (double) current / total;
