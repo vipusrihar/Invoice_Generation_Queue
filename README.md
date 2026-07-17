@@ -3,7 +3,7 @@
 A hands-on demonstration of the **Competing Consumers pattern** using RabbitMQ and Spring Boot 3.
 Built as part of a Distributed Systems university assignment and documented as a complete beginner-friendly tutorial.
 
-> 📖 **Full Tutorial Article:** [Read on Medium](#) *(link will be added after publishing)*
+> 📖 **Full Tutorial Article:** [Read on Medium](https://medium.com/@vipusrihar/i-built-a-rabbitmq-work-queue-in-spring-boot-heres-what-i-learned-22c02e11c4f1)
 
 > 🔗 **Repository:** [https://github.com/vipusrihar/Invoice_Generation_Queue](https://github.com/vipusrihar/Invoice_Generation_Queue)
 
@@ -391,7 +391,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081"
 
 The complete article explaining every concept, analogy, and decision:
 
-👉 **[Read on Medium](#)** *(link will be updated after publishing)*
+👉 **[Read on Medium](https://medium.com/@vipusrihar/i-built-a-rabbitmq-work-queue-in-spring-boot-heres-what-i-learned-22c02e11c4f1)**
 
 ---
 
